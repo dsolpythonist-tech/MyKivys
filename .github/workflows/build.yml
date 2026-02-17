@@ -5,7 +5,6 @@ on:
     branches: [ main, master ]
   pull_request:
     branches: [ main, master ]
-  # Allow manual trigger from GitHub UI
   workflow_dispatch:
 
 jobs:
@@ -38,11 +37,13 @@ jobs:
         run: |
           sudo apt-get update -y
 
-          # libtinfo5 was dropped in Ubuntu 22.04; install libtinfo6 and
-          # create the symlink that the Android NDK toolchain still looks for.
+          # libtinfo5 is gone on Ubuntu 22.04 — install v6 and symlink for NDK
           sudo apt-get install -y libtinfo6
           sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 \
-                      /usr/lib/x86_64-linux-gnu/libtinfo.so.5 || true
+                      /usr/lib/x86_64-linux-gnu/libtinfo.so.5 2>/dev/null || true
+
+          # libunwind-dev must come before gstreamer (unmet dep otherwise)
+          sudo apt-get install -y libunwind-dev
 
           sudo apt-get install -y \
             git zip unzip wget \
@@ -58,7 +59,6 @@ jobs:
             libsdl2-mixer-dev libsdl2-ttf-dev \
             libportmidi-dev \
             libswscale-dev libavformat-dev libavcodec-dev \
-            libunwind-dev \
             libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
             gstreamer1.0-plugins-good \
@@ -66,71 +66,70 @@ jobs:
 
       # ── 5. Set JAVA_HOME ────────────────────────────────────────────────────
       - name: Set JAVA_HOME
-        run: echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
+        run: |
+          echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
 
       # ── 6. Install Python build tools ───────────────────────────────────────
+      # IMPORTANT: python-for-android recipes break with Cython 3+. Pin to <3.
       - name: Install Python dependencies
         run: |
-          pip install --upgrade pip
-          pip install buildozer cython==0.29.37
+          pip install --upgrade pip setuptools wheel
+          pip install "cython<3" buildozer
 
-      # ── 7. Rename your script to main.py if needed ──────────────────────────
-      #    If your entry point is already called main.py, delete this step.
+      # ── 7. Ensure entry point is main.py ────────────────────────────────────
       - name: Ensure entry point is main.py
         run: |
           if [ ! -f main.py ]; then
-            # Rename whichever .py file contains PestRepellerApp().run()
             ENTRY=$(grep -rl "PestRepellerApp().run()" *.py | head -1)
             if [ -n "$ENTRY" ]; then
               cp "$ENTRY" main.py
-              echo "Copied $ENTRY → main.py"
+              echo "Copied $ENTRY to main.py"
             else
               echo "ERROR: Could not find app entry point!" && exit 1
             fi
           fi
 
-      # ── 8. Accept Android SDK licenses (non-interactive) ────────────────────
+      # ── 8. Pre-write Android SDK license hashes ─────────────────────────────
+      # Writing hashes directly avoids the interactive pipe that races in CI
       - name: Accept Android SDK licenses
         run: |
           mkdir -p $HOME/.android
           touch $HOME/.android/repositories.cfg
-          yes | buildozer android update 2>/dev/null || true
+
+          SDK_LICENSES=$HOME/.buildozer/android/platform/android-sdk/licenses
+          mkdir -p "$SDK_LICENSES"
+
+          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n" \
+            > "$SDK_LICENSES/android-sdk-license"
+          printf "84831b9409646a918e30573bab4c9c91346d8abd\n504667f4c0de7af1a06de9f4b1727b84351f2910\n" \
+            > "$SDK_LICENSES/android-sdk-preview-license"
+          printf "601085b94cd77f0b54ff86406957099ebe79c4d6\n" \
+            > "$SDK_LICENSES/android-googletv-license"
+          printf "d975f751698a77b662f1254ddbeed3901e976f5a\n" \
+            > "$SDK_LICENSES/intel-android-extra-license"
 
       # ── 9. Build the debug APK ───────────────────────────────────────────────
       - name: Build APK (debug)
-        run: buildozer -v android debug
+        run: |
+          buildozer -v android debug 2>&1 | tee build.log
+          exit ${PIPESTATUS[0]}
         env:
-          ANDROID_SDK_ROOT: ${{ env.HOME }}/.buildozer/android/platform/android-sdk
+          ANDROID_SDK_ROOT: /home/runner/.buildozer/android/platform/android-sdk
+          ANDROID_NDK_HOME: /home/runner/.buildozer/android/platform/android-ndk-r25b
 
-      # ── 10. Upload the APK as a build artifact ───────────────────────────────
+      # ── 10. Upload APK artifact ──────────────────────────────────────────────
       - name: Upload APK artifact
+        if: success()
         uses: actions/upload-artifact@v4
         with:
           name: pest-repeller-debug-apk
-          # Buildozer puts the APK in bin/
           path: bin/*.apk
           retention-days: 30
 
-      # ── (Optional) Build release APK ─────────────────────────────────────────
-      # Uncomment the block below if you want a signed release build.
-      # You'll need to add KEYSTORE_FILE, KEY_ALIAS, KEY_PASSWORD,
-      # and STORE_PASSWORD as GitHub repository secrets first.
-      #
-      # - name: Build APK (release)
-      #   run: buildozer -v android release
-      #
-      # - name: Sign APK
-      #   run: |
-      #     echo "${{ secrets.KEYSTORE_FILE }}" | base64 --decode > keystore.jks
-      #     $ANDROID_SDK_ROOT/build-tools/*/apksigner sign \
-      #       --ks keystore.jks \
-      #       --ks-key-alias "${{ secrets.KEY_ALIAS }}" \
-      #       --ks-pass pass:"${{ secrets.STORE_PASSWORD }}" \
-      #       --key-pass pass:"${{ secrets.KEY_PASSWORD }}" \
-      #       bin/*-release-unsigned.apk
-      #
-      # - name: Upload signed release APK
-      #   uses: actions/upload-artifact@v4
-      #   with:
-      #     name: pest-repeller-release-apk
-      #     path: bin/*-release.apk
+      # ── 11. Always upload the full build log ─────────────────────────────────
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
