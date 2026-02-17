@@ -37,17 +37,31 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -y
+
+          # libtinfo5 was dropped in Ubuntu 22.04; install libtinfo6 and
+          # create the symlink that the Android NDK toolchain still looks for.
+          sudo apt-get install -y libtinfo6
+          sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 \
+                      /usr/lib/x86_64-linux-gnu/libtinfo.so.5 || true
+
           sudo apt-get install -y \
-            git zip unzip openjdk-17-jdk \
-            python3-pip autoconf libtool pkg-config \
-            zlib1g-dev libncurses5-dev libncursesw5-dev \
-            libtinfo5 cmake libffi-dev libssl-dev \
+            git zip unzip wget \
+            openjdk-17-jdk \
+            python3-pip \
+            autoconf automake libtool pkg-config \
+            cmake ninja-build \
+            zlib1g-dev \
+            libncurses5-dev libncursesw5-dev \
+            libffi-dev libssl-dev \
             build-essential libltdl-dev ccache \
             libsdl2-dev libsdl2-image-dev \
             libsdl2-mixer-dev libsdl2-ttf-dev \
-            libportmidi-dev libswscale-dev \
-            libavformat-dev libavcodec-dev \
-            libgstreamer1.0-dev
+            libportmidi-dev \
+            libswscale-dev libavformat-dev libavcodec-dev \
+            libgstreamer1.0-dev \
+            libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-plugins-good \
+            patchelf lld
 
       # ── 5. Set JAVA_HOME ────────────────────────────────────────────────────
       - name: Set JAVA_HOME
