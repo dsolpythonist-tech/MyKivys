@@ -36,15 +36,10 @@ jobs:
       - name: Install system dependencies
         run: |
           sudo apt-get update -y
-
-          # libtinfo5 is gone on Ubuntu 22.04 — install v6 and symlink for NDK
           sudo apt-get install -y libtinfo6
           sudo ln -sf /usr/lib/x86_64-linux-gnu/libtinfo.so.6 \
                       /usr/lib/x86_64-linux-gnu/libtinfo.so.5 2>/dev/null || true
-
-          # libunwind-dev must come before gstreamer (unmet dep otherwise)
           sudo apt-get install -y libunwind-dev
-
           sudo apt-get install -y \
             git zip unzip wget \
             openjdk-17-jdk \
@@ -70,45 +65,93 @@ jobs:
           echo "JAVA_HOME=$(dirname $(dirname $(readlink -f $(which javac))))" >> $GITHUB_ENV
 
       # ── 6. Install Python build tools ───────────────────────────────────────
-      # IMPORTANT: python-for-android recipes break with Cython 3+. Pin to <3.
       - name: Install Python dependencies
         run: |
           pip install --upgrade pip setuptools wheel
           pip install "cython<3" buildozer
 
-      # ── 7. Ensure entry point is main.py ────────────────────────────────────
+      # ── 7. Debug: List all files in the repo ────────────────────────────────
+      - name: List repository contents
+        run: |
+          echo "=== Files in repository root ==="
+          ls -la
+          echo ""
+          echo "=== All Python files ==="
+          find . -name "*.py" -type f
+
+      # ── 8. Ensure entry point is main.py ────────────────────────────────────
       - name: Ensure entry point is main.py
         run: |
-          if [ ! -f main.py ]; then
-            ENTRY=$(grep -rl "PestRepellerApp().run()" *.py | head -1)
-            if [ -n "$ENTRY" ]; then
-              cp "$ENTRY" main.py
-              echo "Copied $ENTRY to main.py"
-            else
-              echo "ERROR: Could not find app entry point!" && exit 1
-            fi
+          # If main.py already exists, we're good
+          if [ -f main.py ]; then
+            echo "✓ main.py found"
+            exit 0
+          fi
+          
+          # Otherwise, try to find the app entry point
+          echo "main.py not found, searching for entry point..."
+          
+          # Look for the app class instantiation
+          ENTRY=$(find . -maxdepth 1 -name "*.py" -type f -exec grep -l "PestRepellerApp().run()" {} \; | head -1)
+          
+          if [ -n "$ENTRY" ]; then
+            echo "Found entry point: $ENTRY"
+            cp "$ENTRY" main.py
+            echo "✓ Copied $ENTRY to main.py"
+          else
+            echo "ERROR: No Python file with PestRepellerApp().run() found!"
+            echo "Please ensure your main Python file is in the repository root."
+            echo ""
+            echo "Available Python files:"
+            find . -maxdepth 1 -name "*.py" -type f
+            exit 1
           fi
 
-      # ── 8. Pre-write Android SDK license hashes ─────────────────────────────
-      # Writing hashes directly avoids the interactive pipe that races in CI
+      # ── 9. Initialize buildozer (downloads SDK) ──────────────────────────────
+      - name: Initialize Buildozer
+        run: |
+          # This command makes buildozer download the Android SDK/NDK
+          # but doesn't start the actual build yet
+          buildozer android update 2>&1 | tee init.log || true
+        env:
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx2048m"
+
+      # ── 10. Accept SDK licenses AFTER SDK is downloaded ──────────────────────
       - name: Accept Android SDK licenses
         run: |
           mkdir -p $HOME/.android
           touch $HOME/.android/repositories.cfg
+          
+          # The SDK should now exist. Accept licenses using sdkmanager.
+          SDK_ROOT="$HOME/.buildozer/android/platform/android-sdk"
+          
+          if [ -d "$SDK_ROOT" ]; then
+            echo "SDK found at: $SDK_ROOT"
+            
+            # Find sdkmanager (it's in cmdline-tools or tools/bin)
+            SDKMANAGER=""
+            if [ -f "$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager" ]; then
+              SDKMANAGER="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
+            elif [ -f "$SDK_ROOT/tools/bin/sdkmanager" ]; then
+              SDKMANAGER="$SDK_ROOT/tools/bin/sdkmanager"
+            fi
+            
+            if [ -n "$SDKMANAGER" ]; then
+              echo "Using sdkmanager: $SDKMANAGER"
+              yes | $SDKMANAGER --licenses || true
+            else
+              echo "sdkmanager not found, writing license hashes directly..."
+              mkdir -p "$SDK_ROOT/licenses"
+              printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n" \
+                > "$SDK_ROOT/licenses/android-sdk-license"
+              printf "84831b9409646a918e30573bab4c9c91346d8abd\n504667f4c0de7af1a06de9f4b1727b84351f2910\n" \
+                > "$SDK_ROOT/licenses/android-sdk-preview-license"
+            fi
+          else
+            echo "WARNING: SDK not found yet, will rely on buildozer.spec settings"
+          fi
 
-          SDK_LICENSES=$HOME/.buildozer/android/platform/android-sdk/licenses
-          mkdir -p "$SDK_LICENSES"
-
-          printf "24333f8a63b6825ea9c5514f83c2829b004d1fee\n8933bad161af4178b1185d1a37fbf41ea5269c55\nd56f5187479451eabf01fb78af6dfcb131a6481e\n" \
-            > "$SDK_LICENSES/android-sdk-license"
-          printf "84831b9409646a918e30573bab4c9c91346d8abd\n504667f4c0de7af1a06de9f4b1727b84351f2910\n" \
-            > "$SDK_LICENSES/android-sdk-preview-license"
-          printf "601085b94cd77f0b54ff86406957099ebe79c4d6\n" \
-            > "$SDK_LICENSES/android-googletv-license"
-          printf "d975f751698a77b662f1254ddbeed3901e976f5a\n" \
-            > "$SDK_LICENSES/intel-android-extra-license"
-
-      # ── 9. Build the debug APK ───────────────────────────────────────────────
+      # ── 11. Build the debug APK ──────────────────────────────────────────────
       - name: Build APK (debug)
         run: |
           buildozer -v android debug 2>&1 | tee build.log
@@ -116,8 +159,9 @@ jobs:
         env:
           ANDROID_SDK_ROOT: /home/runner/.buildozer/android/platform/android-sdk
           ANDROID_NDK_HOME: /home/runner/.buildozer/android/platform/android-ndk-r25b
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx2048m"
 
-      # ── 10. Upload APK artifact ──────────────────────────────────────────────
+      # ── 12. Upload APK artifact ──────────────────────────────────────────────
       - name: Upload APK artifact
         if: success()
         uses: actions/upload-artifact@v4
@@ -126,10 +170,13 @@ jobs:
           path: bin/*.apk
           retention-days: 30
 
-      # ── 11. Always upload the full build log ─────────────────────────────────
-      - name: Upload build log
+      # ── 13. Always upload build logs ─────────────────────────────────────────
+      - name: Upload build logs
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: build-log
-          path: build.log
+          name: build-logs
+          path: |
+            build.log
+            init.log
+          retention-days: 7
